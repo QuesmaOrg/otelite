@@ -21,10 +21,15 @@ stop:
 clean:
 	rm -f $(PIDFILE) otel.db ${BINARY}
 
+build_dist:
+	GOOS=linux GOARCH=amd64 go build -o $(BINARY)-linux-amd64 main.go
+	GOOS=linux GOARCH=arm64 go build -o $(BINARY)-linux-arm64 main.go
+	ls -l $(BINARY)-linux-*
+
 
 test:
 	@curl -s http://localhost:4318/ | grep -q 'otelite' && echo "otelite root: OK" || echo "otelite root: FAILED"
 
 
 
-.PHONY: build start stop clean 
+.PHONY: build build_dist start stop clean

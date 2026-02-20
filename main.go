@@ -19,6 +19,7 @@ import (
 
 	logspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectorpb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 )
@@ -97,6 +98,7 @@ func initDB(dbPath string) error {
 		start_time INTEGER,
 		end_time INTEGER,
 		status_code INTEGER,
+		attributes TEXT,
 		raw_json TEXT
 	);
 	CREATE INDEX IF NOT EXISTS idx_trace_id ON traces(trace_id);
@@ -272,6 +274,9 @@ func handleProtobufTraces(remoteAddr string, body []byte) (int, error) {
 						"code": float64(span.GetStatus().GetCode()),
 					},
 				}
+				if attrs := convertAttributes(span.GetAttributes()); attrs != nil {
+					spanData["attributes"] = attrs
+				}
 
 				if err := insertSpan(serviceName, spanData); err != nil {
 					log.Printf("[%s] failed to insert span: %v", remoteAddr, err)
@@ -283,6 +288,80 @@ func handleProtobufTraces(remoteAddr string, body []byte) (int, error) {
 	}
 
 	return count, nil
+}
+
+func convertAnyValue(v *commonpb.AnyValue) interface{} {
+	if v == nil {
+		return nil
+	}
+	switch val := v.GetValue().(type) {
+	case *commonpb.AnyValue_StringValue:
+		return val.StringValue
+	case *commonpb.AnyValue_BoolValue:
+		return val.BoolValue
+	case *commonpb.AnyValue_IntValue:
+		return val.IntValue
+	case *commonpb.AnyValue_DoubleValue:
+		return val.DoubleValue
+	case *commonpb.AnyValue_BytesValue:
+		return val.BytesValue
+	case *commonpb.AnyValue_ArrayValue:
+		if val.ArrayValue == nil {
+			return nil
+		}
+		arr := make([]interface{}, len(val.ArrayValue.GetValues()))
+		for i, elem := range val.ArrayValue.GetValues() {
+			arr[i] = convertAnyValue(elem)
+		}
+		return arr
+	case *commonpb.AnyValue_KvlistValue:
+		if val.KvlistValue == nil {
+			return nil
+		}
+		return convertAttributes(val.KvlistValue.GetValues())
+	default:
+		return nil
+	}
+}
+
+func convertAttributes(attrs []*commonpb.KeyValue) []interface{} {
+	if len(attrs) == 0 {
+		return nil
+	}
+	result := make([]interface{}, len(attrs))
+	for i, kv := range attrs {
+		result[i] = map[string]interface{}{
+			"key": kv.GetKey(),
+			"value": map[string]interface{}{
+				resolveValueKey(kv.GetValue()): convertAnyValue(kv.GetValue()),
+			},
+		}
+	}
+	return result
+}
+
+func resolveValueKey(v *commonpb.AnyValue) string {
+	if v == nil {
+		return "stringValue"
+	}
+	switch v.GetValue().(type) {
+	case *commonpb.AnyValue_StringValue:
+		return "stringValue"
+	case *commonpb.AnyValue_BoolValue:
+		return "boolValue"
+	case *commonpb.AnyValue_IntValue:
+		return "intValue"
+	case *commonpb.AnyValue_DoubleValue:
+		return "doubleValue"
+	case *commonpb.AnyValue_BytesValue:
+		return "bytesValue"
+	case *commonpb.AnyValue_ArrayValue:
+		return "arrayValue"
+	case *commonpb.AnyValue_KvlistValue:
+		return "kvlistValue"
+	default:
+		return "stringValue"
+	}
 }
 
 func extractServiceName(rsMap map[string]interface{}) string {
@@ -349,10 +428,17 @@ func doInsertSpan(serviceName string, spanMap map[string]interface{}) error {
 		}
 	}
 
+	var attrsJSON *string
+	if attrs, ok := spanMap["attributes"]; ok && attrs != nil {
+		b, _ := json.Marshal(attrs)
+		s := string(b)
+		attrsJSON = &s
+	}
+
 	_, err := db.Exec(`
-		INSERT INTO traces (trace_id, span_id, parent_span_id, service_name, span_name, kind, start_time, end_time, status_code, raw_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, traceID, spanID, parentSpanID, serviceName, spanName, kind, startTime, endTime, statusCode, string(rawJSON))
+		INSERT INTO traces (trace_id, span_id, parent_span_id, service_name, span_name, kind, start_time, end_time, status_code, attributes, raw_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, traceID, spanID, parentSpanID, serviceName, spanName, kind, startTime, endTime, statusCode, attrsJSON, string(rawJSON))
 
 	return err
 }
@@ -497,6 +583,9 @@ func handleProtobufLogs(remoteAddr string, body []byte) (int, error) {
 					"body":           lr.GetBody().GetStringValue(),
 					"timeUnixNano":   fmt.Sprintf("%d", lr.GetTimeUnixNano()),
 				}
+				if attrs := convertAttributes(lr.GetAttributes()); attrs != nil {
+					logData["attributes"] = attrs
+				}
 
 				if err := insertLog(serviceName, logData); err != nil {
 					log.Printf("[%s] failed to insert log: %v", remoteAddr, err)
@@ -553,7 +642,7 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[%s] %s %s", r.RemoteAddr, r.Method, r.URL.Path)
 
 	rows, err := db.Query(`
-		SELECT id, timestamp, trace_id, span_id, parent_span_id, service_name, span_name, kind, start_time, end_time, status_code, raw_json
+		SELECT id, timestamp, trace_id, span_id, parent_span_id, service_name, span_name, kind, start_time, end_time, status_code, attributes, raw_json
 		FROM traces ORDER BY id DESC LIMIT 100
 	`)
 	if err != nil {
@@ -570,12 +659,13 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 		var traceID, spanID, parentSpanID, serviceName, spanName, rawJSON string
 		var kind, statusCode int
 		var startTime, endTime int64
+		var attributes sql.NullString
 
-		if err := rows.Scan(&id, &timestamp, &traceID, &spanID, &parentSpanID, &serviceName, &spanName, &kind, &startTime, &endTime, &statusCode, &rawJSON); err != nil {
+		if err := rows.Scan(&id, &timestamp, &traceID, &spanID, &parentSpanID, &serviceName, &spanName, &kind, &startTime, &endTime, &statusCode, &attributes, &rawJSON); err != nil {
 			continue
 		}
 
-		traces = append(traces, map[string]interface{}{
+		traceEntry := map[string]interface{}{
 			"id":             id,
 			"timestamp":      timestamp,
 			"trace_id":       traceID,
@@ -588,7 +678,11 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 			"end_time":       endTime,
 			"status_code":    statusCode,
 			"raw_json":       json.RawMessage(rawJSON),
-		})
+		}
+		if attributes.Valid {
+			traceEntry["attributes"] = json.RawMessage(attributes.String)
+		}
+		traces = append(traces, traceEntry)
 	}
 
 	log.Printf("[%s] returning %d traces", r.RemoteAddr, len(traces))

@@ -80,7 +80,10 @@ func processInsertJob(job insertJob) {
 
 func initDB(dbPath string) error {
 	var err error
-	db, err = sql.Open("sqlite", dbPath)
+	// WAL lets readers and the writer proceed concurrently; busy_timeout
+	// makes competing connections wait instead of failing with SQLITE_BUSY.
+	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+	db, err = sql.Open("sqlite", dsn)
 	if err != nil {
 		return err
 	}
@@ -763,7 +766,9 @@ func runQuery(args []string) {
 	query := fs.Arg(0)
 
 	var err error
-	db, err = sql.Open("sqlite", *dbPath)
+	// Read-only + busy_timeout so ad-hoc queries don't contend with a
+	// running server's writes.
+	db, err = sql.Open("sqlite", *dbPath+"?_pragma=busy_timeout(5000)&mode=ro")
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}

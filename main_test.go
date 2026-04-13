@@ -5,9 +5,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -239,4 +241,119 @@ func TestLogIngestion(t *testing.T) {
 	if logBody != "Test log message" {
 		t.Errorf("expected body 'Test log message', got '%s'", logBody)
 	}
+}
+
+// TestConcurrentReadWrite reproduces the pytest-vs-server race: a separate
+// DB handle reads in parallel with server-side inserts. Without WAL +
+// busy_timeout this fails with "database is locked".
+func TestConcurrentReadWrite(t *testing.T) {
+	dbPath, _, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	reader, err := sql.Open("sqlite", dbPath+"?_pragma=busy_timeout(5000)&mode=ro")
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer reader.Close()
+
+	makePayload := func(i int) []byte {
+		p := map[string]interface{}{
+			"resourceSpans": []interface{}{map[string]interface{}{
+				"resource": map[string]interface{}{"attributes": []interface{}{
+					map[string]interface{}{"key": "service.name", "value": map[string]interface{}{"stringValue": "race-svc"}},
+				}},
+				"scopeSpans": []interface{}{map[string]interface{}{
+					"spans": []interface{}{map[string]interface{}{
+						"traceId":           fmt.Sprintf("%032x", i),
+						"spanId":            fmt.Sprintf("%016x", i),
+						"name":              "s",
+						"kind":              float64(1),
+						"startTimeUnixNano": "1700000000000000000",
+						"endTimeUnixNano":   "1700000001000000000",
+						"status":            map[string]interface{}{"code": float64(0)},
+					}},
+				}},
+			}},
+		}
+		b, _ := json.Marshal(p)
+		return b
+	}
+
+	const writers = 4
+	const perWriter = 50
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Writers: concurrent POSTs to the trace handler.
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				req := httptest.NewRequest(http.MethodPost, "/v1/traces",
+					bytes.NewReader(makePayload(w*perWriter+i)))
+				req.Header.Set("Content-Type", "application/json")
+				rec := httptest.NewRecorder()
+				handleTraces(rec, req)
+				if rec.Code != http.StatusOK {
+					t.Errorf("write %d/%d: status %d", w, i, rec.Code)
+					return
+				}
+			}
+		}(w)
+	}
+
+	// Reader: hammer COUNT(*) until writers stop.
+	var readErr error
+	var reads int
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var n int
+			if err := reader.QueryRow("SELECT COUNT(*) FROM traces").Scan(&n); err != nil {
+				readErr = err
+				return
+			}
+			reads++
+		}
+	}()
+
+	// Poll until the insert worker has drained everything.
+	expected := writers * perWriter
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		if err := reader.QueryRow("SELECT COUNT(*) FROM traces").Scan(&n); err != nil {
+			t.Fatalf("reader query failed mid-test: %v", err)
+		}
+		if n >= expected {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	close(stop)
+	wg.Wait()
+
+	if readErr != nil {
+		t.Fatalf("reader got error (expected WAL+busy_timeout to prevent this): %v", readErr)
+	}
+	if reads == 0 {
+		t.Fatal("reader never completed a query")
+	}
+
+	var final int
+	if err := reader.QueryRow("SELECT COUNT(*) FROM traces").Scan(&final); err != nil {
+		t.Fatalf("final read: %v", err)
+	}
+	if final != expected {
+		t.Errorf("expected %d rows, got %d", expected, final)
+	}
+	t.Logf("completed %d concurrent reads alongside %d writes", reads, expected)
 }
